@@ -95,9 +95,12 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     final path = await NativeCaptureBridge.captureInstant();
+    await _checkPermissions();
+    if (!mounted) return;
     setState(() => _isProcessing = false);
 
-    if (path != null && mounted) {
+    if (path != null) {
+      setState(() => _statusMessage = 'Screenshot captured!');
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => EditorViewerScreen(imagePath: path),
@@ -105,7 +108,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     } else {
       setState(() {
-        _statusMessage = 'Capture failed. Ensure projection permission is granted.';
+        _statusMessage = 'Capture cancelled or failed. Please allow screen recording permission.';
       });
     }
   }

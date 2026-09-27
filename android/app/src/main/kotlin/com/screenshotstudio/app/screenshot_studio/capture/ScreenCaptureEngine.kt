@@ -11,10 +11,10 @@ import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
-import kotlinx.coroutines.CompletableDeferred
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -25,78 +25,44 @@ class ScreenCaptureEngine(private val context: Context) {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private val handler = Handler(Looper.getMainLooper())
+    private var latestBitmap: Bitmap? = null
+    private val bitmapLock = Any()
+    private var activeProjection: MediaProjection? = null
 
-    fun captureFrame(
-        mediaProjection: MediaProjection,
-        outputDir: File,
-        callback: (Result<String>) -> Unit
-    ) {
-        // Android 14+ requires a MediaProjection.Callback to be registered
-        // before createVirtualDisplay(), otherwise it throws a SecurityException.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !callbackRegistered) {
-            mediaProjection.registerCallback(object : MediaProjection.Callback() {}, handler)
-            callbackRegistered = true
-        }
+    fun startSession(mediaProjection: MediaProjection) {
+        stopSession()
+        activeProjection = mediaProjection
 
         val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
+        val width: Int
+        val height: Int
+        val density: Int
 
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val windowMetrics = windowManager.currentWindowMetrics
+            val bounds = windowMetrics.bounds
+            width = bounds.width()
+            height = bounds.height()
+            density = context.resources.configuration.densityDpi
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            width = metrics.widthPixels
+            height = metrics.heightPixels
+            density = metrics.densityDpi
+        }
 
-        // Setup ImageReader for maximum fidelity (RGBA_8888)
+        Log.i(TAG, "startSession: display resolution ${width}x$height, density=$density")
+
         val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         imageReader = reader
 
-        val display = try {
-            mediaProjection.createVirtualDisplay(
-                "ScreenshotStudio_VirtualDisplay",
-                width,
-                height,
-                density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.surface,
-                null,
-                handler
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "createVirtualDisplay failed", t)
-            cleanUp()
-            callback(Result.failure(RuntimeException("createVirtualDisplay failed: ${t.message}")))
-            return
-        }
-        virtualDisplay = display
-        Log.i(TAG, "virtualDisplay created=${display != null} ${width}x$height")
-
-        if (display == null) {
-            cleanUp()
-            callback(Result.failure(RuntimeException("createVirtualDisplay returned null")))
-            return
-        }
-
-        var captured = false
-
-        val timeout = Runnable {
-            if (!captured) {
-                captured = true
-                Log.e(TAG, "capture timed out waiting for first frame")
-                cleanUp()
-                callback(Result.failure(RuntimeException("Timed out waiting for screen frame")))
-            }
-        }
-        handler.postDelayed(timeout, 5000)
-
         reader.setOnImageAvailableListener({ ir ->
-            if (captured) return@setOnImageAvailableListener
             var image: Image? = null
             try {
                 image = ir.acquireLatestImage()
                 if (image != null) {
-                    captured = true
-                    handler.removeCallbacks(timeout)
                     val planes = image.planes
                     val buffer: ByteBuffer = planes[0].buffer
                     val pixelStride = planes[0].pixelStride
@@ -110,46 +76,120 @@ class ScreenCaptureEngine(private val context: Context) {
                     )
                     bitmap.copyPixelsFromBuffer(buffer)
 
-                    // Crop out the padding if rowPadding exists
                     val finalBitmap = if (rowPadding > 0) {
                         Bitmap.createBitmap(bitmap, 0, 0, width, height)
                     } else {
                         bitmap
                     }
 
-                    // Save high-resolution PNG
-                    val fileName = "capture_${System.currentTimeMillis()}.png"
-                    val file = File(outputDir, fileName)
-                    FileOutputStream(file).use { out ->
-                        finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    synchronized(bitmapLock) {
+                        latestBitmap?.recycle()
+                        latestBitmap = finalBitmap
                     }
-
-                    Log.i(TAG, "frame captured -> ${file.absolutePath}")
-                    cleanUp()
-                    callback(Result.success(file.absolutePath))
                 }
             } catch (e: Exception) {
-                if (!captured) {
-                    captured = true
-                    handler.removeCallbacks(timeout)
-                    Log.e(TAG, "frame capture error", e)
-                    cleanUp()
-                    callback(Result.failure(e))
-                }
+                Log.e(TAG, "Error acquiring image from ImageReader: ${e.message}")
             } finally {
                 image?.close()
             }
         }, handler)
+
+        try {
+            val display = mediaProjection.createVirtualDisplay(
+                "ScreenshotStudio_VirtualDisplay",
+                width,
+                height,
+                density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.surface,
+                null,
+                handler
+            )
+            virtualDisplay = display
+            Log.i(TAG, "VirtualDisplay successfully created")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to create VirtualDisplay", t)
+            stopSession()
+            throw t
+        }
     }
 
-    private var callbackRegistered = false
+    fun captureFrame(outputDir: File, callback: (Result<String>) -> Unit) {
+        // If we already have a latestBitmap in buffer, save it right away
+        var bmp: Bitmap? = null
+        synchronized(bitmapLock) {
+            if (latestBitmap != null && !latestBitmap!!.isRecycled) {
+                bmp = latestBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
+            }
+        }
 
-    private fun cleanUp() {
+        if (bmp != null) {
+            saveBitmapToFile(bmp!!, outputDir, callback)
+            return
+        }
+
+        // Otherwise, poll up to 2.5 seconds for the first incoming frame
+        var captured = false
+        val startTime = SystemClock.elapsedRealtime()
+        val timeout = 2500L
+
+        fun pollFrame() {
+            if (captured) return
+
+            synchronized(bitmapLock) {
+                if (latestBitmap != null && !latestBitmap!!.isRecycled) {
+                    bmp = latestBitmap!!.copy(Bitmap.Config.ARGB_8888, false)
+                }
+            }
+
+            if (bmp != null) {
+                captured = true
+                saveBitmapToFile(bmp!!, outputDir, callback)
+            } else if (SystemClock.elapsedRealtime() - startTime > timeout) {
+                captured = true
+                Log.e(TAG, "Timed out waiting for frame from ImageReader")
+                callback(Result.failure(RuntimeException("Timed out waiting for screen frame")))
+            } else {
+                handler.postDelayed({ pollFrame() }, 50)
+            }
+        }
+
+        pollFrame()
+    }
+
+    private fun saveBitmapToFile(bitmap: Bitmap, outputDir: File, callback: (Result<String>) -> Unit) {
+        try {
+            val fileName = "capture_${System.currentTimeMillis()}.png"
+            val file = File(outputDir, fileName)
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Log.i(TAG, "Screenshot saved successfully: ${file.absolutePath}")
+            callback(Result.success(file.absolutePath))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save screenshot bitmap", e)
+            callback(Result.failure(e))
+        }
+    }
+
+    fun isSessionActive(): Boolean {
+        return virtualDisplay != null && activeProjection != null
+    }
+
+    fun stopSession() {
         try {
             virtualDisplay?.release()
             virtualDisplay = null
             imageReader?.close()
             imageReader = null
-        } catch (_: Exception) {}
+            synchronized(bitmapLock) {
+                latestBitmap?.recycle()
+                latestBitmap = null
+            }
+            activeProjection = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception during stopSession: ${e.message}")
+        }
     }
 }
+

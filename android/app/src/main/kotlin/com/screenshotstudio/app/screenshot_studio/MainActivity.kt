@@ -34,7 +34,8 @@ class MainActivity : FlutterActivity() {
     private var captureEngine: ScreenCaptureEngine? = null
     private var stitchingEngine: ImageStitchingEngine? = null
     private var overlayManager: FloatingOverlayManager? = null
-    private var pendingMethodResult: MethodChannel.Result? = null
+    private var pendingPermissionResult: MethodChannel.Result? = null
+    private var pendingCaptureResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -60,20 +61,18 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "requestCapturePermission" -> {
-                    Log.i(TAG, "requestCapturePermission: existing projection=${mediaProjection != null}")
-                    if (mediaProjection != null) {
+                    val isSessionReady = captureEngine?.isSessionActive() == true
+                    Log.i(TAG, "requestCapturePermission: isSessionReady=$isSessionReady")
+                    if (isSessionReady) {
                         result.success(true)
                     } else {
-                        pendingMethodResult = result
-                        // Android 14+ requires a running mediaProjection foreground service
-                        // *before* getMediaProjection(). Start it up-front so it is already
-                        // foregrounded by the time the consent dialog returns.
+                        pendingPermissionResult = result
                         startCaptureService()
                         val captureIntent = mediaProjectionManager?.createScreenCaptureIntent()
                         if (captureIntent != null) {
                             startActivityForResult(captureIntent, REQUEST_MEDIA_PROJECTION)
                         } else {
-                            pendingMethodResult = null
+                            pendingPermissionResult = null
                             result.error("ERROR", "MediaProjectionManager unavailable", null)
                         }
                     }
@@ -87,7 +86,7 @@ class MainActivity : FlutterActivity() {
                     result.success(hasOverlayPermission)
                 }
                 "checkCapturePermission" -> {
-                    val granted = mediaProjection != null
+                    val granted = captureEngine?.isSessionActive() == true
                     Log.i(TAG, "checkCapturePermission: $granted")
                     result.success(granted)
                 }
@@ -110,7 +109,20 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "captureInstant" -> {
-                    performInstantCapture(result)
+                    if (captureEngine?.isSessionActive() == true) {
+                        performInstantCapture(result)
+                    } else {
+                        Log.i(TAG, "captureInstant: Session not active, requesting screen capture permission first")
+                        pendingCaptureResult = result
+                        startCaptureService()
+                        val captureIntent = mediaProjectionManager?.createScreenCaptureIntent()
+                        if (captureIntent != null) {
+                            startActivityForResult(captureIntent, REQUEST_MEDIA_PROJECTION)
+                        } else {
+                            pendingCaptureResult = null
+                            result.error("ERROR", "MediaProjectionManager unavailable", null)
+                        }
+                    }
                 }
                 "stitchImages" -> {
                     val paths = call.argument<List<String>>("paths")
@@ -140,20 +152,14 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun performInstantCapture(result: MethodChannel.Result) {
-        val proj = mediaProjection
-        Log.i(TAG, "captureInstant: mediaProjection=${proj != null}")
-        if (proj == null) {
-            result.error("NOT_INITIALIZED", "MediaProjection permission not granted yet", null)
-            return
-        }
-
         val outputDir = File(cacheDir, "captures").apply { mkdirs() }
-        captureEngine?.captureFrame(proj, outputDir) { res ->
+        captureEngine?.captureFrame(outputDir) { res ->
             res.fold(
                 onSuccess = { filePath ->
                     result.success(filePath)
                 },
                 onFailure = { err ->
+                    Log.e(TAG, "performInstantCapture failure: ${err.message}")
                     result.error("CAPTURE_ERROR", err.message, null)
                 }
             )
@@ -187,9 +193,8 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * getMediaProjection() throws a SecurityException until the mediaProjection
-     * foreground service has actually called startForeground(). Because that happens
-     * asynchronously on the main looper, wait (briefly) for it before acquiring.
+     * getMediaProjection() requires the mediaProjection foreground service
+     * to be active. We poll briefly for service foregrounding before calling getMediaProjection.
      */
     private fun acquireProjection(resultCode: Int, data: Intent) {
         val deadline = SystemClock.elapsedRealtime() + 3000
@@ -203,23 +208,61 @@ class MainActivity : FlutterActivity() {
             }
 
             Log.i(TAG, "acquireProjection: service foregrounded=${ScreenCaptureForegroundService.isForegrounded}")
-            mediaProjection = try {
+            val proj = try {
                 mediaProjectionManager?.getMediaProjection(resultCode, data)
             } catch (t: Throwable) {
                 Log.e(TAG, "getMediaProjection threw: $t")
                 null
             }
-            Log.i(TAG, "acquireProjection: projection acquired=${mediaProjection != null}")
-            if (mediaProjection != null) {
-                pendingMethodResult?.success(true)
+
+            mediaProjection = proj
+            Log.i(TAG, "acquireProjection: projection acquired=${proj != null}")
+
+            if (proj != null) {
+                // Register callback immediately
+                proj.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        Log.i(TAG, "MediaProjection stopped by system")
+                        captureEngine?.stopSession()
+                        if (mediaProjection == proj) {
+                            mediaProjection = null
+                        }
+                    }
+                }, Handler(Looper.getMainLooper()))
+
+                // Start capture session with the fresh projection
+                try {
+                    captureEngine?.startSession(proj)
+                    pendingPermissionResult?.success(true)
+                    pendingPermissionResult = null
+
+                    if (pendingCaptureResult != null) {
+                        val captureRes = pendingCaptureResult!!
+                        pendingCaptureResult = null
+                        performInstantCapture(captureRes)
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Failed to start capture session on projection: $t")
+                    mediaProjection = null
+                    pendingPermissionResult?.error("SESSION_FAILED", t.message, null)
+                    pendingPermissionResult = null
+                    pendingCaptureResult?.error("SESSION_FAILED", t.message, null)
+                    pendingCaptureResult = null
+                }
             } else {
-                pendingMethodResult?.error(
+                pendingPermissionResult?.error(
                     "PROJECTION_NULL",
-                    "getMediaProjection returned null (is the foreground service running?)",
+                    "getMediaProjection returned null",
                     null
                 )
+                pendingPermissionResult = null
+                pendingCaptureResult?.error(
+                    "PROJECTION_NULL",
+                    "getMediaProjection returned null",
+                    null
+                )
+                pendingCaptureResult = null
             }
-            pendingMethodResult = null
         }
 
         attempt()
@@ -234,8 +277,10 @@ class MainActivity : FlutterActivity() {
                 startCaptureService()
                 acquireProjection(resultCode, data)
             } else {
-                pendingMethodResult?.success(false)
-                pendingMethodResult = null
+                pendingPermissionResult?.success(false)
+                pendingPermissionResult = null
+                pendingCaptureResult?.error("PERMISSION_DENIED", "Screen capture permission was not granted", null)
+                pendingCaptureResult = null
                 stopCaptureService()
             }
         }
@@ -244,10 +289,8 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         super.onDestroy()
         overlayManager?.hide()
-        val serviceIntent = Intent(this, ScreenCaptureForegroundService::class.java).apply {
-            action = ScreenCaptureForegroundService.ACTION_STOP
-        }
-        stopService(serviceIntent)
+        captureEngine?.stopSession()
+        stopCaptureService()
         mediaProjection?.stop()
         mediaProjection = null
     }
